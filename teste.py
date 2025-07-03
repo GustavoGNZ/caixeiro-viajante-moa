@@ -2,165 +2,194 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
-import pandas as pd
+import random
+from pulp import *
+import matplotlib.patches as mpatches
 
-# --- Carregar o arquivo XML ---
-# Substitua pelo caminho do seu arquivo, se necessário
-tree = ET.parse("burma14.xml")
-root = tree.getroot()
+# ------------------------------
+# Função: Leitura da matriz de custos do XML
+# ------------------------------
+def ler_matriz_custos_do_xml(caminho_arquivo):
+    tree = ET.parse(caminho_arquivo)
+    root = tree.getroot()
+    vertices = root.find("graph").findall("vertex")
+    n = len(vertices)
+    cost_matrix = np.zeros((n, n))
+    for i, vertex in enumerate(vertices):
+        for edge in vertex.findall("edge"):
+            j = int(edge.text)
+            cost = float(edge.attrib["cost"])
+            cost_matrix[i][j] = cost
+    return cost_matrix
 
-# --- Extrair vértices e matriz de custos ---
-vertices = root.find("graph").findall("vertex")
-n = len(vertices)
-cost_matrix = np.zeros((n, n))
+# ------------------------------
+# Função: Aplicar variação de calado
+# ------------------------------
+def aplicar_variacao_calado(calado_base, percentual_reducao, reducao_metros, seed=None):
+    calado_modificado = calado_base.copy()
+    n_portos = len(calado_base)
+    n_reduzir = int(np.ceil(n_portos * percentual_reducao))
+    if seed is not None:
+        random.seed(seed)
+    portos_para_reduzir = random.sample(range(1, n_portos), n_reduzir) if n_reduzir > 0 else []
+    for p in portos_para_reduzir:
+        calado_modificado[p] = max(0, calado_modificado[p] - reducao_metros)
+    return calado_modificado, portos_para_reduzir
 
-for i, vertex in enumerate(vertices):
-    for edge in vertex.findall("edge"):
-        j = int(edge.text)
-        cost = float(edge.attrib["cost"])
-        cost_matrix[i][j] = cost
+# ------------------------------
+# Função: Criar e resolver modelo PCVLC (PLI)
+# ------------------------------
+def criar_e_resolver_modelo(cost_matrix, demanda_portos, calado_portos):
+    n = len(cost_matrix)
+    carga_total = demanda_portos.sum()
 
-# --------------------------------------------------------------------------
-# ETAPA 1: ADAPTAR A ESTRUTURA DE DADOS PARA O PCVLC
-# --------------------------------------------------------------------------
+    prob = LpProblem("PCVLC", LpMinimize)
+    x = LpVariable.dicts("x", ((i, j) for i in range(n) for j in range(n) if i != j), cat='Binary')
+    y = LpVariable.dicts("y", ((i, j) for i in range(n) for j in range(n) if i != j), lowBound=0, cat='Continuous')
 
+    prob += lpSum(cost_matrix[i][j] * x[i, j] for i in range(n) for j in range(n) if i != j)
 
-def adaptar_para_pcvlc(num_portos, restriction_level=0.25):
-    """
-    Cria a estrutura de dados dos portos com demanda e limite de calado.
-    - [cite_start]Demanda de carga para cada porto de destino[cite: 56].
-    - [cite_start]Limite de calado para uma porcentagem dos portos[cite: 134].
-    """
-    portos = []
-    # Gera demandas aleatórias para os portos de destino (1 a n-1)
-    demandas = np.random.randint(10, 41, size=num_portos)
-    demandas[0] = 0  # Porto de origem não tem demanda
+    for k in range(n):
+        prob += lpSum(x[i, k] for i in range(n) if i != k) == 1
+        prob += lpSum(x[k, j] for j in range(n) if j != k) == 1
 
-    carga_total = np.sum(demandas)
+    for j in range(1, n):
+        prob += lpSum(y[i, j] for i in range(n) if i != j) - lpSum(y[j, k] for k in range(n) if k != j) == demanda_portos[j]
 
-    for i in range(num_portos):
-        portos.append({
-            "id": i,
-            "demanda": demandas[i],
-            "limite_calado": float('inf')  # Padrão: sem limite
-        })
+    prob += lpSum(y[0, j] for j in range(1, n)) == carga_total
+    prob += lpSum(y[i, 0] for i in range(1, n)) == 0
 
-    # Define o limite de calado para uma porcentagem dos portos
-    num_portos_restritos = int((num_portos - 1) * restriction_level)
-    portos_destino_ids = list(range(1, num_portos))
-    portos_restritos_ids = np.random.choice(
-        portos_destino_ids, size=num_portos_restritos, replace=False)
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                prob += y[i, j] <= calado_portos[j] * x[i, j]
 
-    print(f"Adaptação para PCVLC ({restriction_level*100}% de restrição):")
-    print(f"Portos com limite de calado: {sorted(list(portos_restritos_ids))}")
+    prob.solve(PULP_CBC_CMD(timeLimit=300))
+    return prob, x, y
 
-    for porto_id in portos_restritos_ids:
-        # O limite deve ser um desafio: menor que a carga total, mas não trivial.
-        limite = carga_total * np.random.uniform(0.7, 0.95)
-        portos[porto_id]["limite_calado"] = int(limite)
+# ------------------------------
+# Função: Reconstruir rota sequencial
+# ------------------------------
+def reconstruir_rota(x, n):
+    rota = [(i, j) for i in range(n) for j in range(n) if i != j and x[i, j].varValue > 0.5]
+    rota_dict = {i: j for i, j in rota}
+    caminho = [0]
+    atual = 0
+    while True:
+        proximo = rota_dict.get(atual)
+        if proximo is None or proximo == 0:
+            break
+        caminho.append(proximo)
+        atual = proximo
+    caminho.append(0)
+    return rota, caminho
 
-    return portos
+# ------------------------------
+# Função: Plotar o grafo com solução ótima
+# ------------------------------
+def plotar_grafo_solucao_duplo(n, cost_matrix, rota, caminho, calado_portos, y, portos_reduzidos):
+    G_completo = nx.DiGraph()
+    G_otimo = nx.DiGraph()
 
-# --------------------------------------------------------------------------
-# ETAPA 2: CRIAR A FUNÇÃO DE VALIDAÇÃO DA ROTA
-# --------------------------------------------------------------------------
+    all_edges = [(i, j) for i in range(n) for j in range(n) if i != j and cost_matrix[i][j] > 0]
 
+    G_completo.add_nodes_from(range(n))
+    G_completo.add_edges_from(all_edges)
 
-def validar_e_calcular_custo(rota, portos, cost_matrix):
-    """
-    Verifica se uma rota é válida segundo as regras do PCVLC e calcula seu custo.
-    - [cite_start]O navio sai com a carga total e vai descarregando[cite: 57].
-    - [cite_start]A carga atual não pode exceder o limite do próximo porto[cite: 58].
-    """
-    # Validação básica da rota
-    if rota[0] != 0 or rota[-1] != 0 or len(set(rota[1:-1])) != len(portos) - 1:
-        print("ERRO: Rota inválida. Deve ser um circuito Hamiltoniano começando e terminando em 0.")
-        return float('inf'), False
+    G_otimo.add_nodes_from(range(n))
+    G_otimo.add_edges_from(rota)
 
-    carga_atual = sum(p["demanda"] for p in portos)
-    custo_total = 0
+    pos = nx.kamada_kawai_layout(G_completo)
 
-    print(f"\nValidando Rota: {rota} | Carga Inicial: {carga_atual}")
+    node_colors = ['lightgreen' if i in portos_reduzidos else 'skyblue' for i in range(n)]
+    node_labels = {i: f"{i}\nC:{calado_portos[i]:.1f}" for i in range(n)}
 
-    for i in range(len(rota) - 1):
-        porto_origem_id = rota[i]
-        porto_destino_id = rota[i+1]
+    plt.figure(figsize=(24, 10), dpi=120)
 
-        limite_porto_destino = portos[porto_destino_id]["limite_calado"]
+    # -------- Grafo da Solução Ótima (esquerda) --------
+    plt.subplot(1, 2, 1)
+    nx.draw_networkx_nodes(G_otimo, pos, node_color=node_colors, node_size=1000, edgecolors='black')
+    nx.draw_networkx_labels(G_otimo, pos, labels=node_labels, font_size=9, font_weight='bold')
 
-        # A verificação CRUCIAL do PCVLC
-        if carga_atual > limite_porto_destino:
-            print(
-                f"  ❌ ROTA INVÁLIDA no trecho {porto_origem_id} -> {porto_destino_id}")
-            print(
-                f"     Carga Atual ({carga_atual}) > Limite do Porto {porto_destino_id} ({limite_porto_destino})")
-            return float('inf'), False
+    edge_colors = []
+    edge_widths = []
+    for (i, j) in rota:
+        carga = y[(i, j)].varValue if (i, j) in y else 0
+        edge_colors.append('red')
+        edge_widths.append(1 + carga / 10)
 
-        # Se a rota é válida até aqui, atualiza custo e carga
-        custo_etapa = cost_matrix[porto_origem_id][porto_destino_id]
-        custo_total += custo_etapa
-        demanda_descarregada = portos[porto_destino_id]["demanda"]
-        carga_atual -= demanda_descarregada
+    nx.draw_networkx_edges(
+        G_otimo, pos, edgelist=rota, edge_color=edge_colors, width=edge_widths,
+        arrows=True, arrowsize=15, arrowstyle='->', connectionstyle='arc3,rad=0.1'
+    )
+    plt.title("Solução Ótima (Rota com Carga)")
+    plt.axis("off")
 
-        print(
-            f"  ✅ Trecho {porto_origem_id} -> {porto_destino_id} (Custo: {custo_etapa:.0f}). Carga restante: {carga_atual}")
+    # -------- Grafo Completo (direita) --------
+    plt.subplot(1, 2, 2)
+    nx.draw_networkx_nodes(G_completo, pos, node_color=node_colors, node_size=1000, edgecolors='black')
+    nx.draw_networkx_labels(G_completo, pos, labels=node_labels, font_size=9, font_weight='bold')
+    nx.draw_networkx_edges(
+        G_completo, pos, edge_color='lightgray', width=0.6, style='dotted',
+        arrows=True, arrowsize=10, arrowstyle='->', connectionstyle='arc3,rad=0.1'
+    )
+    plt.title("Grafo Completo (Todas as Conexões)")
+    plt.axis("off")
 
-    return custo_total, True
+    # -------- Legenda --------
+    normal_patch = mpatches.Patch(color='skyblue', label='Porto com calado normal')
+    reduzido_patch = mpatches.Patch(color='lightgreen', label='Porto com calado reduzido')
+    plt.legend(handles=[normal_patch, reduzido_patch], loc='lower center', bbox_to_anchor=(-0.1, -0.15), ncol=2, fontsize=10, frameon=True)
 
+    plt.tight_layout()
+    plt.show()
 
-# --- EXECUTANDO A ADAPTAÇÃO E VALIDAÇÃO ---
-# 1. Adaptar a instância `burma14` para PCVLC com 25% de portos restritos
-portos_pcvlc = adaptar_para_pcvlc(n, restriction_level=0.25)
-print("\n📋 Dados dos Portos (PCVLC):")
-print(pd.DataFrame(portos_pcvlc).set_index('id'))
+# ------------------------------
+# MAIN
+# ------------------------------
+if __name__ == "__main__":
+    # Leitura de dados
+    cost_matrix = ler_matriz_custos_do_xml("burma14.xml")
+    n = cost_matrix.shape[0]
 
-# 2. Definir rotas de teste
-# Rota que provavelmente será válida (visita portos em ordem, descarregando aos poucos)
-rota_valida_provavel = list(range(n)) + [0]
-# Rota que provavelmente será inválida (tenta visitar um porto restrito no início)
-portos_restritos = [p['id']
-                    for p in portos_pcvlc if p['limite_calado'] != float('inf')]
-if portos_restritos:
-    primeiro_restrito = portos_restritos[0]
-    outros_portos = [p for p in range(1, n) if p != primeiro_restrito]
-    rota_invalida_provavel = [0, primeiro_restrito] + outros_portos + [0]
-else:
-    rota_invalida_provavel = None  # Caso não haja portos restritos
+    demanda_portos = np.array([0, 2.5, 1.8, 3.0, 2.0, 1.5, 2.2, 1.9, 3.1, 2.4, 1.7, 2.6, 2.8, 1.4])
+    carga_total = demanda_portos.sum()
+    calado_portos_base = np.full(n, carga_total)
+    calado_portos_base[0] = carga_total
 
-# 3. Validar as rotas
-custo, eh_valida = validar_e_calcular_custo(
-    rota_valida_provavel, portos_pcvlc, cost_matrix)
-if eh_valida:
-    print(f"\n🎉 Rota Válida! Custo Total: {custo:.2f}\n")
+    percentual_reducao = 0.5
+    reducao_metros = 5
+    seed = 42
 
-if rota_invalida_provavel:
-    custo, eh_valida = validar_e_calcular_custo(
-        rota_invalida_provavel, portos_pcvlc, cost_matrix)
-    if not eh_valida:
-        print("\n🎉 Teste de Rota Inválida bem-sucedido!\n")
+    calado_portos, portos_reduzidos = aplicar_variacao_calado(calado_portos_base, percentual_reducao, reducao_metros, seed=seed)
 
-# --------------------------------------------------------------------------
-# SEU CÓDIGO ORIGINAL DE VISUALIZAÇÃO (sem alterações)
-# --------------------------------------------------------------------------
+    # Resolução do modelo
+    prob, x, y = criar_e_resolver_modelo(cost_matrix, demanda_portos, calado_portos)
 
-# --- Mostrar matriz de custos em tabela ---
-cost_df = pd.DataFrame(cost_matrix.astype(int), columns=[
-                       f"To {j}" for j in range(n)], index=[f"From {i}" for i in range(n)])
-print("\n📋 Matriz de Custos Original (de cada cidade para cada cidade):")
-print(cost_df)
+    if prob.status == LpStatusOptimal:
+        rota, caminho = reconstruir_rota(x, n)
+        custo_total = value(prob.objective)
 
-# --- Criar e desenhar o grafo ---
-G = nx.from_numpy_array(cost_matrix)
-pos = nx.spring_layout(G, seed=42, k=2.5)
+        print(f"Carga total: {carga_total:.2f}")
+        print(f"Portos com calado reduzido ({percentual_reducao*100:.0f}%): {portos_reduzidos}")
+        print(f"Calado dos portos: {calado_portos}")
 
-plt.figure(figsize=(16, 12))
-nx.draw_networkx_nodes(G, pos, node_size=1200, node_color='skyblue')
-nx.draw_networkx_labels(G, pos, font_size=14, font_weight='bold')
-nx.draw_networkx_edges(G, pos, connectionstyle='arc3,rad=0.1')
-edge_labels = nx.get_edge_attributes(G, 'weight')
-nx.draw_networkx_edge_labels(G, pos, edge_labels={
-                             k: f"{v:.0f}" for k, v in edge_labels.items()}, font_size=10, font_color='black')
-plt.title("Grafo da Instância BURMA14 (TSPLIB)", fontsize=18)
-plt.axis("off")
-plt.tight_layout()
-plt.show()
+        print("\nRota ótima sequencial:", caminho)
+        print(f"Custo total da rota: {custo_total:.2f}")
+        print("Etapas da rota e custos:")
+
+        # custo_acumulado = 0
+        # for i in range(len(caminho) - 1):
+        #     origem = caminho[i]
+        #     destino = caminho[i + 1]
+        #     custo = cost_matrix[origem][destino]
+        #     carga = y[(origem, destino)].varValue if (origem, destino) in y else 0
+        #     print(f"{origem} -> {destino} | custo: {custo} | calado destino: {calado_portos[destino]:.2f} | carga: {carga:.2f}")
+        #     custo_acumulado += custo
+
+        # print(f"Custo acumulado calculado: {custo_acumulado:.2f}")
+
+        # Visualização
+        plotar_grafo_solucao_duplo(n, cost_matrix, rota, caminho, calado_portos, y, portos_reduzidos)
+    else:
+        print("Solução não encontrada.")
