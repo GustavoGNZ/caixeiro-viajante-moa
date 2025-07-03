@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 import random
+from pulp import *
 
 # --- Leitura do XML ---
 tree = ET.parse("burma14.xml")
@@ -18,111 +19,130 @@ for i, vertex in enumerate(vertices):
         cost = float(edge.attrib["cost"])
         cost_matrix[i][j] = cost
 
-# --- Dados iniciais (exemplo) ---
-# Demanda em cada porto (exemplo simples, pode adaptar)
+# --- Dados do problema ---
 demanda_portos = np.array([0, 2.5, 1.8, 3.0, 2.0, 1.5, 2.2, 1.9, 3.1, 2.4, 1.7, 2.6, 2.8, 1.4])
-# Limite de calado em metros para cada porto
-calado_portos_base = np.array([9.0, 8.0, 7.5, 9.0, 7.0, 8.2, 8.5, 7.3, 8.0, 8.1, 7.8, 7.9, 8.3, 7.2])
 
-# Carga inicial total do navio (soma das demandas)
-carga_inicial = demanda_portos.sum()
-calado_navio_max = 9.0  # calado máximo inicial do navio (com carga total)
+# --- Ajuste dos calados para garantir viabilidade ---
+carga_total = demanda_portos.sum()
+calado_portos_base = np.full(n, carga_total)
+calado_portos_base[0] = carga_total  # Porto 0 aceita carga total
 
-# --- Função para aplicar variação no limite de calado ---
-def aplicar_variacao_calado(calado_base, percentual_reducao, reducao_metros):
+# --- Função para aplicar variação de calado ---
+def aplicar_variacao_calado(calado_base, percentual_reducao, reducao_metros, seed=None):
     calado_modificado = calado_base.copy()
     n_portos = len(calado_base)
     n_reduzir = int(np.ceil(n_portos * percentual_reducao))
-    portos_para_reduzir = random.sample(range(n_portos), n_reduzir)
+    if seed is not None:
+        random.seed(seed)
+    portos_para_reduzir = random.sample(range(1, n_portos), n_reduzir) if n_reduzir > 0 else []
     for p in portos_para_reduzir:
         calado_modificado[p] = max(0, calado_modificado[p] - reducao_metros)
     return calado_modificado, portos_para_reduzir
 
-# --- Função que calcula calado do navio baseado na carga atual (linear) ---
-def calcular_calado_navio(carga_atual, carga_total, calado_max):
-    # Exemplo simples: calado decresce proporcionalmente à carga
-    return (carga_atual / carga_total) * calado_max
+# --- Escolha do cenário de variação de calado ---
 
-# --- Função para construir rota respeitando calado variável e visita todos portos ---
-def construir_rota_calado_variavel(cost_matrix, calado_portos, demanda_portos, calado_navio_max):
-    n = len(calado_portos)
-    carga_total = demanda_portos.sum()
-    carga_atual = carga_total
-    porto_atual = 0
-    rota = [porto_atual]
-    portos_restantes = set(range(1, n))
-    
-    while portos_restantes:
-        calado_navio = calcular_calado_navio(carga_atual, carga_total, calado_navio_max)
-        
-        # Portos onde navio pode atracar com calado atual
-        portos_validos = [p for p in portos_restantes if calado_navio <= calado_portos[p]]
-        if not portos_validos:
-            print("Não há portos válidos para calado atual:", calado_navio)
-            break
-        
-        # Escolhe o porto válido mais próximo
-        proximo = min(portos_validos, key=lambda p: cost_matrix[porto_atual][p])
-        rota.append(proximo)
-        portos_restantes.remove(proximo)
-        
-        # Descarrega carga neste porto
-        carga_atual -= demanda_portos[proximo]
-        if carga_atual < 0:
-            carga_atual = 0
-        porto_atual = proximo
-    
-    rota.append(0)  # retorna ao porto inicial
-    return rota
+percentual_reducao = 0.1   # 10% dos portos
+reducao_metros = 5        # Redução de 10 unidades 
+seed = 42                   # Para reprodutibilidade
 
-# --- Exemplo: aplicar variação de calado em 10% dos portos, reduzindo 0.5m ---
-percentual_reducao = 0.10
-reduz_metros = 0.5
-calado_portos, portos_reduzidos = aplicar_variacao_calado(calado_portos_base, percentual_reducao, reduz_metros)
+calado_portos, portos_reduzidos = aplicar_variacao_calado(calado_portos_base, percentual_reducao, reducao_metros, seed=seed)
 
+print(f"Carga total: {carga_total:.2f}")
 print(f"Portos com calado reduzido ({percentual_reducao*100:.0f}%): {portos_reduzidos}")
-print(f"Limites de calado após variação:\n{calado_portos}")
+print(f"Calado dos portos: {calado_portos}")
 
-# --- Construir rota considerando calado variável ---
-rota = construir_rota_calado_variavel(cost_matrix, calado_portos, demanda_portos, calado_navio_max)
+# --- MODELO PuLP ---
+prob = LpProblem("PCVLC", LpMinimize)
 
-# --- Calcular custo total da rota ---
-custo_total = 0
-for i in range(len(rota)-1):
-    custo_total += cost_matrix[rota[i]][rota[i+1]]
+x = LpVariable.dicts("x", ((i, j) for i in range(n) for j in range(n) if i != j), cat='Binary')
+y = LpVariable.dicts("y", ((i, j) for i in range(n) for j in range(n) if i != j), lowBound=0, cat='Continuous')
 
-print("\nRota construída respeitando calado variável:")
-print(rota)
-print(f"Custo total da rota: {custo_total:.2f}")
+# Objetivo
+prob += lpSum(cost_matrix[i][j] * x[i, j] for i in range(n) for j in range(n) if i != j)
 
-# --- Plotar o grafo e a rota ---
-G = nx.Graph()
-G.add_nodes_from(range(n))
+# Grau de entrada e saída
+for k in range(n):
+    prob += lpSum(x[i, k] for i in range(n) if i != k) == 1
+    prob += lpSum(x[k, j] for j in range(n) if j != k) == 1
+
+# Fluxo de carga
+for j in range(1, n):
+    prob += lpSum(y[i, j] for i in range(n) if i != j) - lpSum(y[j, k] for k in range(n) if k != j) == demanda_portos[j]
+
+# Carga inicial e final
+prob += lpSum(y[0, j] for j in range(1, n)) == carga_total
+prob += lpSum(y[i, 0] for i in range(1, n)) == 0
+
+# Restrição de calado
 for i in range(n):
     for j in range(n):
-        if i != j and cost_matrix[i][j] > 0:
-            G.add_edge(i, j, weight=cost_matrix[i][j])
+        if i != j:
+            prob += y[i, j] <= calado_portos[j] * x[i, j]
 
-pos = nx.spring_layout(G, seed=42, k=2.5)
+# Resolver
+prob.solve(PULP_CBC_CMD(timeLimit=300))
 
-plt.figure(figsize=(16, 12))
-nx.draw_networkx_nodes(G, pos, node_size=1200,
-                       node_color=['lightgreen' if i in portos_reduzidos else 'skyblue' for i in range(n)])
-nx.draw_networkx_labels(G, pos, font_size=14, font_weight='bold')
-nx.draw_networkx_edges(G, pos, edge_color='lightgray')
+if prob.status == LpStatusOptimal:
+    rota = [(i, j) for i in range(n) for j in range(n) if i != j and x[i, j].varValue > 0.5]
+    custo_total = value(prob.objective)
 
-edge_labels = nx.get_edge_attributes(G, 'weight')
-nx.draw_networkx_edge_labels(
-    G, pos,
-    edge_labels={k: f"{v:.0f}" for k, v in edge_labels.items()},
-    font_size=10,
-    font_color='black'
-)
+    # Reconstruir a rota sequencial a partir das arestas
+    rota_dict = {i: j for i, j in rota}
+    caminho = [0]
+    atual = 0
+    while True:
+        proximo = rota_dict.get(atual)
+        if proximo is None or proximo == 0:
+            break
+        caminho.append(proximo)
+        atual = proximo
+    caminho.append(0)  # Fecha o ciclo
 
-edges_rota = [(rota[i], rota[i+1]) for i in range(len(rota)-1)]
-nx.draw_networkx_edges(G, pos, edgelist=edges_rota, edge_color='red', width=3)
+    print("Rota ótima sequencial:", caminho)
+    print(f"Custo total da rota: {custo_total:.2f}")
 
-plt.title(f"Rota PCVLC com {percentual_reducao*100:.0f}% portos reduzidos em calado", fontsize=18)
-plt.axis("off")
-plt.tight_layout()
-plt.show()
+    print("Etapas da rota e custos:")
+    custo_acumulado = 0
+    for i in range(len(caminho) - 1):
+        origem = caminho[i]
+        destino = caminho[i + 1]
+        custo = cost_matrix[origem][destino]
+        # Mostra também o calado e a carga transportada
+        carga = y[(origem, destino)].varValue if (origem, destino) in y else 0
+        print(f"{origem} -> {destino} | custo: {custo} | calado destino: {calado_portos[destino]:.2f} | carga: {carga:.2f}")
+        custo_acumulado += custo
+    print(f"Custo acumulado calculado: {custo_acumulado}")
+
+    # --- Plot ---
+    G = nx.DiGraph()
+    G.add_nodes_from(range(n))
+    for i in range(n):
+        for j in range(n):
+            if i != j and cost_matrix[i][j] > 0:
+                G.add_edge(i, j, weight=cost_matrix[i][j])
+
+    pos = nx.spring_layout(G, seed=42, k=2.5)
+
+    plt.figure(figsize=(16, 12))
+    nx.draw_networkx_nodes(G, pos, node_size=1200,
+                           node_color=['lightgreen' if i in portos_reduzidos else 'skyblue' for i in range(n)])
+    nx.draw_networkx_labels(G, pos, font_size=14, font_weight='bold')
+
+    # Todas as arestas possíveis em cinza claro
+    all_edges = [(i, j) for i in range(n) for j in range(n) if i != j and cost_matrix[i][j] > 0]
+    nx.draw_networkx_edges(G, pos, edgelist=all_edges, edge_color='lightgray', style='dotted', arrows=True, alpha=0.5)
+
+    # Rótulos de custo para todas as arestas
+    all_edge_labels = {(i, j): f"{cost_matrix[i][j]:.0f}" for i, j in all_edges}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=all_edge_labels, font_size=8, font_color='gray', label_pos=0.7)
+
+    # Destacar as arestas da solução ótima em vermelho
+    nx.draw_networkx_edges(G, pos, edgelist=rota, edge_color='red', width=3, arrows=True)
+
+    plt.title("Rota Otimizada via PLI (PCVLC) com PuLP", fontsize=18)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+else:
+    print("\nSolução não encontrada.")
