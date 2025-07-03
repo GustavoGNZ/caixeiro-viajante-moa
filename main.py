@@ -75,7 +75,7 @@ def reconstruir_rota(x, n):
     caminho.append(0)
     return rota, caminho
 
-def plotar_e_salvar_grafo(nome_instancia, n, cost_matrix, rota, caminho, calado_portos, y, portos_reduzidos, pasta_imagens):
+def plotar_e_salvar_grafo(nome_instancia, n, cost_matrix, rota, caminho, calado_portos, y, portos_reduzidos, pasta_imagens, percentual_reducao):
     G_completo = nx.DiGraph()
     G_otimo = nx.DiGraph()
 
@@ -127,13 +127,13 @@ def plotar_e_salvar_grafo(nome_instancia, n, cost_matrix, rota, caminho, calado_
     plt.tight_layout()
 
     os.makedirs(pasta_imagens, exist_ok=True)
-    nome_arquivo_imagem = os.path.join(pasta_imagens, f"{nome_instancia}_grafico.png")
+    nome_arquivo_imagem = os.path.join(
+        pasta_imagens,
+        f"{nome_instancia}_grafico_{int(percentual_reducao * 100)}.png"
+    )
     plt.savefig(nome_arquivo_imagem)
     plt.close()
 
-# ---------------------------------
-# MAIN: Executa para todas as instâncias
-# ---------------------------------
 import time
 import json
 import os
@@ -162,13 +162,12 @@ if __name__ == "__main__":
         calado_portos_base = np.full(n, carga_total)
         calado_portos_base[0] = carga_total
 
-        percentual_reducao = 0.5
+        percentual_reducao = 0.5 
         reducao_metros = 5
         seed = 42
 
         calado_portos, portos_reduzidos = aplicar_variacao_calado(calado_portos_base, percentual_reducao, reducao_metros, seed=seed)
 
-        # Medir tempo de resolução do solver
         start = time.perf_counter()
         prob, x, y = criar_e_resolver_modelo(cost_matrix, demanda_portos, calado_portos)
         end = time.perf_counter()
@@ -190,14 +189,20 @@ if __name__ == "__main__":
             resultado["rota_otima"] = caminho
             resultado["custo_total"] = custo_total
 
+            # Nome base com percentual para arquivos
+            nome_base_com_percentual = f"{nome_instancia}_grafico_{int(percentual_reducao * 100)}"
+
             plotar_e_salvar_grafo(
-                nome_instancia, n, cost_matrix, rota, caminho, calado_portos, y, portos_reduzidos, pasta_imagens
+                nome_instancia, n, cost_matrix, rota, caminho, calado_portos, y, portos_reduzidos, pasta_imagens, percentual_reducao
             )
             print(f"Instância {nome_instancia}: solução ótima encontrada, custo = {custo_total:.2f}, tempo = {tempo_resolucao:.2f}s")
         else:
             print(f"Instância {nome_instancia}: solução não encontrada, status = {LpStatus[prob.status]}")
 
-        # Salvar JSON com os resultados
-        caminho_json = os.path.join(pasta_resultados, f"{nome_instancia}_resultado.json")
+            # Mesmo nome base mesmo que sem solução
+            nome_base_com_percentual = f"{nome_instancia}_grafico_{int(percentual_reducao * 100)}"
+
+        # Salvar JSON com nome igual da imagem (com percentual)
+        caminho_json = os.path.join(pasta_resultados, f"{nome_base_com_percentual}.json")
         with open(caminho_json, "w") as f:
             json.dump(resultado, f, indent=4)
